@@ -12,253 +12,286 @@ from speechbrain.pretrained import SpeakerRecognition
 import cv2
 import pytesseract
 from collections import defaultdict
+from huggingface_hub import login
+from pyannote.audio import Pipeline
+import traceback
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # Configure CORS properly
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-UPLOAD_FOLDER = 'uploads'
+UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Load models
+# =========================
+# MODELS
+# =========================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 whisper_model = whisper.load_model("tiny")
-speaker_model = SpeakerRecognition.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="tmp_model")
-summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-6-6", device=0 if torch.cuda.is_available() else -1)
 
-# Tesseract OCR path (update this path as needed for your system)
-pytesseract.pytesseract.tesseract_cmd = '/opt/homebrew/bin/tesseract'
+speaker_model = SpeakerRecognition.from_hparams(
+    source="speechbrain/spkrec-ecapa-voxceleb",
+    savedir="tmp_model"
+)
 
+summarizer = pipeline(
+    "summarization",
+    model="sshleifer/distilbart-cnn-6-6",
+    device=0 if torch.cuda.is_available() else -1
+)
+
+# OCR path
+pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
+
+# =========================
+# HUGGINGFACE TOKEN (SAFE)
+# =========================
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+if HF_TOKEN:
+    login(token=HF_TOKEN)
+else:
+    print("⚠️ HF_TOKEN not set in environment")
+
+# =========================
+# DIARIZATION INIT
+# =========================
+diarization_pipeline = None
+
+try:
+    diarization_pipeline = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-3.1",
+        token=HF_TOKEN
+    )
+    print("✅ Diarization pipeline loaded successfully")
+except Exception:
+    print("❌ Diarization init failed:")
+    traceback.print_exc()
+
+# =========================
+# AUDIO EXTRACTION
+# =========================
 def extract_audio(video_path, audio_path):
-    ffmpeg.input(video_path).output(audio_path, format='wav').run(overwrite_output=True)
+    ffmpeg.input(video_path).output(
+        audio_path,
+        format="wav",
+        ar=16000,
+        ac=1
+    ).run(overwrite_output=True)
 
+# =========================
+# DIARIZATION
+# =========================
+def perform_speaker_diarization(audio_path):
+    if diarization_pipeline is None:
+        raise Exception("Diarization pipeline not initialized")
+
+    diarization = diarization_pipeline(audio_path)
+
+    segments = []
+    for segment, speaker in diarization.speaker_diarization:
+        segments.append({
+            "start": float(segment.start),
+            "end": float(segment.end),
+            "speaker": speaker
+        })
+
+    return segments
+
+# =========================
+# OCR NAME EXTRACTION
+# =========================
 def extract_names_from_frames(video_path):
     import re
+
     cap = cv2.VideoCapture(video_path)
-    name_timestamps = []
+    names = []
+
     frame_rate = int(cap.get(cv2.CAP_PROP_FPS))
-    frame_interval = frame_rate * 2  # Every 2 seconds
-    
-    # Timestamp pattern to exclude
-    timestamp_pattern = re.compile(r'\d{4}-\d{2}-\d{2}|\d{2}:\d{2}:\d{2}')
-    
+    interval = frame_rate * 2
+    timestamp_pattern = re.compile(r"\d{4}-\d{2}-\d{2}|\d{2}:\d{2}:\d{2}")
+
     idx = 0
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-            
-        if idx % frame_interval == 0:
-            h, w = frame.shape[:2]
-            # Extract only the center region where the name appears
-            # Based on your screenshot, the name appears in the center in a black box
-            center_y = h // 2
-            center_x = w // 2
-            
-            # Create a region of interest around the center where the name is likely to be
-            # Adjust these values based on your specific video layout
-            name_roi = frame[center_y - 50:center_y + 50, center_x - 200:center_x + 200]
-            
-            # Convert to grayscale for OCR
-            name_roi_gray = cv2.cvtColor(name_roi, cv2.COLOR_BGR2GRAY)
-            
-            # Apply threshold to make text more visible
-            _, binary = cv2.threshold(name_roi_gray, 200, 255, cv2.THRESH_BINARY)
-            
-            # Get text from center region
-            text = pytesseract.image_to_string(binary).strip()
-            
-            # Filter the text to remove empty lines and timestamps
-            for line in text.split('\n'):
-                clean_line = line.strip()
-                # Skip empty lines, timestamps, or very short text
-                if not clean_line or len(clean_line) < 2 or timestamp_pattern.search(clean_line):
-                    continue
-                    
-                # Check if this looks like a name (reasonable length, no digits)
-                if len(clean_line) < 30 and clean_line.isprintable() and not any(c.isdigit() for c in clean_line):
-                    current_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-                    print(f"🧾 OCR Detected Name at {current_time:.2f}s: {clean_line}")
-                    # Add to our list of detected names with timestamps
-                    name_timestamps.append((current_time, clean_line))
-        
-        idx += 1
-        
-    cap.release()
-    return name_timestamps
 
-def map_names_to_segments(transcription_segments, name_timestamps):
-    mapped = defaultdict(list)
-    
-    # If no names were detected, use "Unknown Speaker" for everything
-    if not name_timestamps:
-        for segment in transcription_segments:
-            mapped["Unknown Speaker"].append(segment['text'])
-        return mapped
-    
-    # Sort name_timestamps by time for efficient processing
-    name_timestamps.sort(key=lambda x: x[0])
-    
-    # For each segment, find the most recent speaker name that appeared before it
-    for segment in transcription_segments:
-        segment_start = segment['start']
-        segment_text = segment['text']
-        
-        # Default speaker name if we can't find a better match
-        current_speaker = "Unknown Speaker"
-        
-        # Find the most recent name that appeared before this segment started
+        if idx % interval == 0:
+            h, w = frame.shape[:2]
+            roi = frame[h//2-50:h//2+50, w//2-200:w//2+200]
+
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+
+            text = pytesseract.image_to_string(binary).strip()
+
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line or len(line) < 2:
+                    continue
+                if timestamp_pattern.search(line):
+                    continue
+                if any(c.isdigit() for c in line):
+                    continue
+
+                time_sec = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                print(f"🧾 OCR Name {time_sec:.2f}s: {line}")
+                names.append((time_sec, line))
+
+        idx += 1
+
+    cap.release()
+    return names
+
+# =========================
+# NAME MAPPING
+# =========================
+def map_names_to_diarization(speaker_segments, name_timestamps):
+    mapping = {}
+
+    for seg in speaker_segments:
+        spk = seg["speaker"]
+        start = seg["start"]
+        end = seg["end"]
+
+        if spk in mapping:
+            continue
+
+        best_name = None
+        best_dist = 5.0
+
         for ts, name in name_timestamps:
-            # Only consider names that appeared before or right at the segment start
-            # (with a small buffer for synchronization issues)
-            if ts <= segment_start + 0.5:
-                current_speaker = name
-            else:
-                # Since name_timestamps is sorted, once we find a timestamp
-                # after our segment, we can stop looking
+            if start <= ts <= end:
+                best_name = name
                 break
-                
-        # Add this segment's text to the appropriate speaker's collection
-        mapped[current_speaker].append(segment_text)
-        
+
+            dist = min(abs(ts - start), abs(ts - end))
+            if dist < best_dist:
+                best_dist = dist
+                best_name = name
+
+        if best_name:
+            mapping[spk] = best_name
+            print(f"🎯 {spk} → {best_name}")
+
+    return mapping
+
+# =========================
+# SEGMENT → SPEAKER
+# =========================
+def map_speakers_to_segments(trans_segments, speaker_segments):
+    mapped = defaultdict(list)
+
+    for seg in trans_segments:
+        s = seg["start"]
+        e = seg["end"]
+        text = seg["text"]
+
+        best_spk = "Unknown Speaker"
+        best_overlap = 0
+
+        for sp in speaker_segments:
+            ov = max(0, min(e, sp["end"]) - max(s, sp["start"]))
+            if ov > best_overlap:
+                best_overlap = ov
+                best_spk = sp["speaker"]
+
+        mapped[best_spk].append(text)
+
     return mapped
 
-@app.route("/", methods=["GET"])
+# =========================
+# ROUTES
+# =========================
+@app.route("/")
 def index():
-    return jsonify({"message": "Welcome to the AI Meeting Summarizer API. Use /upload to POST a video file."}), 200
-
-@app.route("/status", methods=["GET"])
-def status():
-    # Check if meeting data exists and return video processing status
-    try:
-        with open("meeting_data.json", "r") as f:
-            meeting_data = json.load(f)
-        return jsonify({
-            "status": "Server is running",
-            "videoProcessed": True,
-            "participants": meeting_data.get("participants", [])
-        }), 200
-    except FileNotFoundError:
-        return jsonify({
-            "status": "Server is running",
-            "videoProcessed": False
-        }), 200
+    return jsonify({"message": "AI Meeting Summarizer API"})
 
 @app.route("/upload", methods=["POST"])
 def upload_video():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part in the request"}), 400
-        
-    video = request.files['file']
-    if video.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-        
+    if "file" not in request.files:
+        return jsonify({"error": "No file"}), 400
+
+    video = request.files["file"]
     filename = secure_filename(video.filename)
     video_path = os.path.join(UPLOAD_FOLDER, filename)
     video.save(video_path)
-    
+
     try:
-        audio_filename = f"{uuid.uuid4()}.wav"
-        audio_path = os.path.join(UPLOAD_FOLDER, audio_filename)
+        audio_path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4()}.wav")
         extract_audio(video_path, audio_path)
-        print("✅ Audio extracted:", audio_path)
-        
-        result = whisper_model.transcribe(audio_path, verbose=False, word_timestamps=False)
-        transcription = result.get("text", "")
-        segments = result.get("segments", [])
-        print("✅ Transcription completed. Segments:", len(segments))
-        
-        if not transcription.strip():
-            return jsonify({"error": "Transcription failed or resulted in empty output."}), 500
-            
-        name_timestamps = extract_names_from_frames(video_path)
-        print("✅ Names extracted from frames:", name_timestamps)
-        
-        named_segments = map_names_to_segments(segments, name_timestamps)
-        print("✅ Named segments mapped")
-        
-        full_summary = summarizer(transcription, max_length=150, min_length=50, do_sample=False)[0]['summary_text']
-        print("✅ Full summary generated")
-        
+
+        result = whisper_model.transcribe(audio_path)
+        transcription = result["text"]
+        segments = result["segments"]
+
+        speaker_segments = perform_speaker_diarization(audio_path)
+
+        name_ts = extract_names_from_frames(video_path)
+        mapping = map_names_to_diarization(speaker_segments, name_ts)
+        named = map_speakers_to_segments(segments, speaker_segments)
+
+        final = {}
+        for spk, texts in named.items():
+            name = mapping.get(spk, spk)
+            final[name] = texts
+
+        full_summary = summarizer(transcription, max_length=150, min_length=50)[0]["summary_text"]
+
         speaker_summaries = {}
-        for name, texts in named_segments.items():
-            combined_text = " ".join(texts).strip()
-            if not combined_text:
-                speaker_summaries[name] = "No speech content found."
-                continue
-                
-            try:
-                summary = summarizer(combined_text, max_length=100, min_length=30, do_sample=False)[0]['summary_text']
-                speaker_summaries[name] = summary
-                print(f"✅ Summary for {name}")
-            except Exception as e:
-                speaker_summaries[name] = "Failed to summarize."
-                print(f"⚠️ Failed to summarize for {name}: {e}")
-                
-        # Get a list of unique participants (excluding "Unknown Speaker")
-        participants = [name for name in speaker_summaries.keys() if name != "Unknown Speaker"]
-        
+        for spk, texts in final.items():
+            txt = " ".join(texts).strip()
+            if txt:
+                speaker_summaries[spk] = summarizer(txt, max_length=100, min_length=30)[0]["summary_text"]
+
+        participants = [p for p in speaker_summaries if p != "Unknown Speaker"]
+
         meeting_data = {
             "transcription": transcription,
             "summary": full_summary,
             "speaker_summaries": speaker_summaries,
-            "participants": participants
+            "participants": participants,
+            "speaker_segments": speaker_segments
         }
-        
+
         with open("meeting_data.json", "w") as f:
-            json.dump(meeting_data, f, indent=4)
-        print("✅ meeting_data.json saved")
-        
-        # Return success message with participants list instead of the summary
-        return jsonify({
-            "success": True,
-            "message": "Video analysis complete. I'm ready to answer your questions about this meeting.",
-            "participants": participants
-        })
-        
+            json.dump(meeting_data, f, indent=2)
+
+        return jsonify({"success": True, "participants": participants})
+
     except Exception as e:
-        print("🔥 Error during processing:", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
-@app.route("/ask", methods=["POST", "OPTIONS"])
-def ask_about_meeting():
-    # Handle preflight OPTIONS request
-    if request.method == "OPTIONS":
-        return "", 200
-        
+@app.route("/ask", methods=["POST"])
+def ask():
     data = request.get_json()
-    question = data.get("question", "").lower()
-    
-    try:
-        with open("meeting_data.json", "r") as f:
-            meeting_data = json.load(f)
-    except FileNotFoundError:
-        return jsonify({"response": "Meeting data not found. Please upload a video first."}), 400
-        
-    participants = meeting_data.get("participants", [])
-    
-    if "who" in question and ("participated" in question or "in the meeting" in question):
-        if participants:
-            participant_list = ", ".join(participants)
-            return jsonify({"response": f"The participants in this meeting were: {participant_list}"})
-        else:
-            return jsonify({"response": "I couldn't identify any named participants in this meeting."})
-    elif "whole summary" in question or "meeting summary" in question:
-        return jsonify({"response": meeting_data.get("summary", "No summary found.")})
-        
-    # Check if question mentions any participant name
-    mentioned_name = None
-    for name in meeting_data.get("speaker_summaries", {}):
-        if name.lower() in question and name != "Unknown Speaker":
-            mentioned_name = name
-            break
-            
-    if mentioned_name:
-        return jsonify({"response": meeting_data["speaker_summaries"].get(mentioned_name, "No summary found for this participant.")})
-    else:
-        return jsonify({
-            "response": "What would you like to know about this meeting? You can ask for the whole summary, or about specific participants like: " +
-            ", ".join(participants[:3]) + (", etc." if len(participants) > 3 else ".")
-        })
+    q = data.get("question", "").lower()
 
+    try:
+        with open("meeting_data.json") as f:
+            m = json.load(f)
+    except:
+        return jsonify({"response": "Upload meeting first"}), 400
+
+    participants = m["participants"]
+    summaries = m["speaker_summaries"]
+
+    if "who" in q:
+        return jsonify({"response": ", ".join(participants)})
+
+    for name, text in summaries.items():
+        if name.lower() in q:
+            return jsonify({"response": f"{name}: {text}"})
+
+    if "summary" in q:
+        return jsonify({"response": m["summary"]})
+
+    return jsonify({"response": "Ask about participants or summary"})
+
+# =========================
+# RUN
+# =========================
 if __name__ == "__main__":
     app.run(debug=True, port=5002)
