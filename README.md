@@ -53,13 +53,13 @@ Backend
 bash# Step 1 — Navigate to the project folder
 cd InsightMeet
 
-# Step 2 — Activate the virtual environment
+Step 2 — Activate the virtual environment
 source venv/bin/activate
 
-# Step 3 — Install dependencies
+Step 3 — Install dependencies
 pip install -r requirements.txt
 
-# Step 4 — Start the server
+Step 4 — Start the server
 python3 server.py
 The backend will start at: http://127.0.0.1:5003
 You should see:
@@ -69,10 +69,10 @@ You should see:
 Frontend
 Open a new terminal tab/window and run:
 bash
-# Step 1 — Navigate to the frontend folder
+Step 1 — Navigate to the frontend folder
 cd ai-meeting-app
 
-# Step 2 — Install dependencies (first time only)
+Step 2 — Install dependencies (first time only)
 npm install
-# Step 3 — Start the frontend
+Step 3 — Start the frontend
 npm run dev
