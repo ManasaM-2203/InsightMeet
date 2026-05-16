@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-multipart
+torch
+stable-ts
+transformers
+ffmpeg-python
+accelerate

@@ -1,297 +1,312 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from werkzeug.utils import secure_filename
-import os
-import uuid
-import ffmpeg
-import whisper
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+import stable_whisper
 import torch
-import json
+import uuid
+import os
+import shutil
+import ffmpeg
 from transformers import pipeline
-from speechbrain.pretrained import SpeakerRecognition
-import cv2
-import pytesseract
-from collections import defaultdict
-from huggingface_hub import login
-from pyannote.audio import Pipeline
 import traceback
+import logging
+import uvicorn
 
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+# =========================
+# LOGGING
+# =========================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# =========================
+# FASTAPI APP
+# =========================
+app = FastAPI(title="InsightMeet API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =========================
+# FOLDERS
+# =========================
 UPLOAD_FOLDER = "uploads"
+MEDIA_FOLDER = "media"
+
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(MEDIA_FOLDER, exist_ok=True)
 
 # =========================
-# MODELS
+# DEVICE
 # =========================
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-whisper_model = whisper.load_model("tiny")
-
-speaker_model = SpeakerRecognition.from_hparams(
-    source="speechbrain/spkrec-ecapa-voxceleb",
-    savedir="tmp_model"
-)
-
-summarizer = pipeline(
-    "summarization",
-    model="sshleifer/distilbart-cnn-6-6",
-    device=0 if torch.cuda.is_available() else -1
-)
-
-# OCR path
-pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Using device: {device}")
 
 # =========================
-# HUGGINGFACE TOKEN (SAFE)
+# LOAD MODELS ONCE
 # =========================
-HF_TOKEN = os.getenv("HF_TOKEN")
-
-if HF_TOKEN:
-    login(token=HF_TOKEN)
-else:
-    print("⚠️ HF_TOKEN not set in environment")
-
-# =========================
-# DIARIZATION INIT
-# =========================
-diarization_pipeline = None
-
 try:
-    diarization_pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        token=HF_TOKEN
+    logger.info("Loading Whisper model...")
+    whisper_model = stable_whisper.load_model("base")
+    logger.info("Whisper model loaded successfully.")
+
+    logger.info("Loading summarizer...")
+    summarizer = pipeline(
+        "summarization",
+        model="facebook/bart-large-cnn",
+        device=0 if device == "cuda" else -1,
     )
-    print("✅ Diarization pipeline loaded successfully")
-except Exception:
-    print("❌ Diarization init failed:")
-    traceback.print_exc()
+    logger.info("Summarizer loaded successfully.")
+
+except Exception as e:
+    logger.error(f"Model loading failed: {e}")
+    raise e
 
 # =========================
-# AUDIO EXTRACTION
+# HELPERS
 # =========================
-def extract_audio(video_path, audio_path):
-    ffmpeg.input(video_path).output(
-        audio_path,
-        format="wav",
-        ar=16000,
-        ac=1
-    ).run(overwrite_output=True)
+def extract_audio(input_path: str, output_path: str):
+    """
+    Extract mono 16kHz WAV audio using ffmpeg.
+    """
+    try:
+        (
+            ffmpeg
+            .input(input_path)
+            .output(
+                output_path,
+                format="wav",
+                ar=16000,
+                ac=1
+            )
+            .run(overwrite_output=True, quiet=True)
+        )
+    except Exception as e:
+        logger.error(f"Audio extraction failed: {e}")
+        raise Exception("Failed to extract audio")
 
-# =========================
-# DIARIZATION
-# =========================
-def perform_speaker_diarization(audio_path):
-    if diarization_pipeline is None:
-        raise Exception("Diarization pipeline not initialized")
 
-    diarization = diarization_pipeline(audio_path)
+def safe_summarize(text: str, max_len: int = 150, min_len: int = 40):
+    """
+    Safely summarize text.
+    If text is too short, return original text.
+    """
+    try:
+        words = text.split()
 
-    segments = []
-    for segment, speaker in diarization.speaker_diarization:
-        segments.append({
-            "start": float(segment.start),
-            "end": float(segment.end),
-            "speaker": speaker
-        })
+        if len(words) < 30:
+            return text
 
-    return segments
+        result = summarizer(
+            text,
+            max_length=max_len,
+            min_length=min_len,
+            do_sample=False
+        )
 
-# =========================
-# OCR NAME EXTRACTION
-# =========================
-def extract_names_from_frames(video_path):
-    import re
+        return result[0]["summary_text"]
 
-    cap = cv2.VideoCapture(video_path)
-    names = []
+    except Exception as e:
+        logger.error(f"Summarization failed: {e}")
+        return text
 
-    frame_rate = int(cap.get(cv2.CAP_PROP_FPS))
-    interval = frame_rate * 2
-    timestamp_pattern = re.compile(r"\d{4}-\d{2}-\d{2}|\d{2}:\d{2}:\d{2}")
-
-    idx = 0
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if idx % interval == 0:
-            h, w = frame.shape[:2]
-            roi = frame[h//2-50:h//2+50, w//2-200:w//2+200]
-
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-
-            text = pytesseract.image_to_string(binary).strip()
-
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line or len(line) < 2:
-                    continue
-                if timestamp_pattern.search(line):
-                    continue
-                if any(c.isdigit() for c in line):
-                    continue
-
-                time_sec = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-                print(f"🧾 OCR Name {time_sec:.2f}s: {line}")
-                names.append((time_sec, line))
-
-        idx += 1
-
-    cap.release()
-    return names
 
 # =========================
-# NAME MAPPING
+# ROOT ROUTE
 # =========================
-def map_names_to_diarization(speaker_segments, name_timestamps):
-    mapping = {}
+@app.get("/")
+def root():
+    return {
+        "message": "InsightMeet API — powered by stable-ts + FastAPI"
+    }
 
-    for seg in speaker_segments:
-        spk = seg["speaker"]
-        start = seg["start"]
-        end = seg["end"]
-
-        if spk in mapping:
-            continue
-
-        best_name = None
-        best_dist = 5.0
-
-        for ts, name in name_timestamps:
-            if start <= ts <= end:
-                best_name = name
-                break
-
-            dist = min(abs(ts - start), abs(ts - end))
-            if dist < best_dist:
-                best_dist = dist
-                best_name = name
-
-        if best_name:
-            mapping[spk] = best_name
-            print(f"🎯 {spk} → {best_name}")
-
-    return mapping
 
 # =========================
-# SEGMENT → SPEAKER
+# PROCESS FILE ROUTE
 # =========================
-def map_speakers_to_segments(trans_segments, speaker_segments):
-    mapped = defaultdict(list)
+@app.post("/process-file/")
+async def process_file(file: UploadFile = File(...)):
 
-    for seg in trans_segments:
-        s = seg["start"]
-        e = seg["end"]
-        text = seg["text"]
+    file_id = str(uuid.uuid4())
 
-        best_spk = "Unknown Speaker"
-        best_overlap = 0
+    ext = os.path.splitext(file.filename)[1].lower()
 
-        for sp in speaker_segments:
-            ov = max(0, min(e, sp["end"]) - max(s, sp["start"]))
-            if ov > best_overlap:
-                best_overlap = ov
-                best_spk = sp["speaker"]
+    raw_path = os.path.join(
+        UPLOAD_FOLDER,
+        f"{file_id}{ext}"
+    )
 
-        mapped[best_spk].append(text)
-
-    return mapped
-
-# =========================
-# ROUTES
-# =========================
-@app.route("/")
-def index():
-    return jsonify({"message": "AI Meeting Summarizer API"})
-
-@app.route("/upload", methods=["POST"])
-def upload_video():
-    if "file" not in request.files:
-        return jsonify({"error": "No file"}), 400
-
-    video = request.files["file"]
-    filename = secure_filename(video.filename)
-    video_path = os.path.join(UPLOAD_FOLDER, filename)
-    video.save(video_path)
+    audio_path = os.path.join(
+        UPLOAD_FOLDER,
+        f"{file_id}.wav"
+    )
 
     try:
-        audio_path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4()}.wav")
-        extract_audio(video_path, audio_path)
+        # =========================
+        # SAVE UPLOADED FILE
+        # =========================
+        logger.info("Saving uploaded file...")
 
-        result = whisper_model.transcribe(audio_path)
-        transcription = result["text"]
-        segments = result["segments"]
+        with open(raw_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
 
-        speaker_segments = perform_speaker_diarization(audio_path)
+        # =========================
+        # EXTRACT AUDIO
+        # =========================
+        logger.info("Extracting audio...")
+        extract_audio(raw_path, audio_path)
 
-        name_ts = extract_names_from_frames(video_path)
-        mapping = map_names_to_diarization(speaker_segments, name_ts)
-        named = map_speakers_to_segments(segments, speaker_segments)
+        # =========================
+        # SAVE MEDIA FOR STREAMING
+        # =========================
+        media_output = os.path.join(
+            MEDIA_FOLDER,
+            f"{file_id}{ext}"
+        )
 
-        final = {}
-        for spk, texts in named.items():
-            name = mapping.get(spk, spk)
-            final[name] = texts
+        shutil.copy(raw_path, media_output)
 
-        full_summary = summarizer(transcription, max_length=150, min_length=50)[0]["summary_text"]
+        # =========================
+        # TRANSCRIPTION
+        # =========================
+        logger.info("Starting transcription...")
 
-        speaker_summaries = {}
-        for spk, texts in final.items():
-            txt = " ".join(texts).strip()
-            if txt:
-                speaker_summaries[spk] = summarizer(txt, max_length=100, min_length=30)[0]["summary_text"]
+        result = whisper_model.transcribe(
+            audio_path,
+            regroup=True
+        )
 
-        participants = [p for p in speaker_summaries if p != "Unknown Speaker"]
+        # =========================
+        # BUILD SEGMENTS
+        # =========================
+        segments = []
 
-        meeting_data = {
-            "transcription": transcription,
-            "summary": full_summary,
-            "speaker_summaries": speaker_summaries,
-            "participants": participants,
-            "speaker_segments": speaker_segments
+        for seg in result.segments:
+            segments.append({
+                "start": round(seg.start, 2),
+                "end": round(seg.end, 2),
+                "speaker": "Speaker",
+                "text": seg.text.strip()
+            })
+
+        # =========================
+        # FULL TRANSCRIPT
+        # =========================
+        full_text = " ".join(
+            segment["text"]
+            for segment in segments
+        )
+
+        # =========================
+        # SUMMARIZATION
+        # =========================
+        logger.info("Generating summary...")
+
+        summary = safe_summarize(full_text)
+
+        # =========================
+        # KEY POINTS
+        # =========================
+        key_points = [
+            segment["text"]
+            for segment in segments
+            if len(segment["text"].split()) > 4
+        ][:6]
+
+        # =========================
+        # DURATION
+        # =========================
+        duration_sec = segments[-1]["end"] if segments else 0
+
+        mins = int(duration_sec // 60)
+        secs = int(duration_sec % 60)
+
+        logger.info("Processing completed successfully.")
+
+        return {
+            "success": True,
+            "file_id": file_id,
+            "file_ext": ext,
+            "duration": f"{mins}:{secs:02d}",
+            "segments": segments,
+            "summary": summary,
+            "key_points": key_points,
+            "participants": ["Speaker"]
         }
-
-        with open("meeting_data.json", "w") as f:
-            json.dump(meeting_data, f, indent=2)
-
-        return jsonify({"success": True, "participants": participants})
 
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
 
-@app.route("/ask", methods=["POST"])
-def ask():
-    data = request.get_json()
-    q = data.get("question", "").lower()
+        logger.error(f"Processing failed: {e}")
 
-    try:
-        with open("meeting_data.json") as f:
-            m = json.load(f)
-    except:
-        return jsonify({"response": "Upload meeting first"}), 400
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
-    participants = m["participants"]
-    summaries = m["speaker_summaries"]
+    finally:
+        # =========================
+        # CLEAN TEMP FILES
+        # =========================
+        for path in [raw_path, audio_path]:
+            if os.path.exists(path):
+                os.remove(path)
 
-    if "who" in q:
-        return jsonify({"response": ", ".join(participants)})
-
-    for name, text in summaries.items():
-        if name.lower() in q:
-            return jsonify({"response": f"{name}: {text}"})
-
-    if "summary" in q:
-        return jsonify({"response": m["summary"]})
-
-    return jsonify({"response": "Ask about participants or summary"})
 
 # =========================
-# RUN
+# MEDIA STREAM ROUTE
+# =========================
+@app.get("/media/{file_id}")
+async def get_media(file_id: str):
+
+    supported_extensions = [
+        ".mp4",
+        ".mov",
+        ".avi",
+        ".mkv",
+        ".mp3",
+        ".wav",
+        ".m4a"
+    ]
+
+    for ext in supported_extensions:
+
+        path = os.path.join(
+            MEDIA_FOLDER,
+            f"{file_id}{ext}"
+        )
+
+        if os.path.exists(path):
+            return FileResponse(path)
+
+    raise HTTPException(
+        status_code=404,
+        detail="Media file not found"
+    )
+
+
+# =========================
+# HEALTH CHECK
+# =========================
+@app.get("/health")
+def health_check():
+    return {
+        "status": "running",
+        "device": device
+    }
+
+
+# =========================
+# RUN SERVER
 # =========================
 if __name__ == "__main__":
-    app.run(debug=True, port=5002)
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )
