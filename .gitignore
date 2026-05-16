@@ -1,0 +1,26 @@
+# Virtual Environments
+venv/
+env/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Media and Uploads (Dynamic data)
+uploads/
+media/
+tmp_model/
+
+# Node.js / Frontend
+node_modules/
+ai-meeting-app/node_modules/
+ai-meeting-app/dist/
+ai-meeting-app/dist-ssr/
+ai-meeting-app/*.local
+
+# OS Files
+.DS_Store
+*.swp
